@@ -1,0 +1,10 @@
+[Unit]
+Description=Rotate windscribe-pool node every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=windscribe-rotate.service
+
+[Install]
+WantedBy=timers.target

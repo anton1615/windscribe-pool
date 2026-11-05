@@ -1,0 +1,13 @@
+# Rotate one node (uid=rotate) every 5 minutes — optional.
+# The API binds to the host's Tailscale address by default; curling the
+# tailnet address from the same host works, or set BIND_HOST=127.0.0.1
+# in the pool service and point this at 127.0.0.1.
+#
+# windscribe-rotate.service
+[Unit]
+Description=windscribe-pool: rotate uid=rotate node every 5 min
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=-/bin/sh -c 'ip=$(ip -4 addr show tailscale0 | awk "/inet /{print \\$2}" | cut -d/ -f1); /usr/bin/curl -fsS --max-time 120 "http://$ip:8094/rotate?uid=rotate"'

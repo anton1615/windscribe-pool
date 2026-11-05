@@ -1,0 +1,16 @@
+[Unit]
+Description=windscribe-pool (per-client OpenVPN exits on free Windscribe nodes + mihomo subscription)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# hostname clients use in socks5://... URLs and /sub output (e.g. the tailnet name)
+Environment=PUBLIC_HOST=pool-host.example.ts.net
+ExecStart=/usr/bin/python3 -u /opt/windscribe-pool/wspool.py
+Restart=always
+RestartSec=5
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

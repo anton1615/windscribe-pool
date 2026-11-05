@@ -1,0 +1,14 @@
+# credentials & runtime state — never commit
+accounts/
+inbox/
+conf/
+logs/
+state.json
+serverlist.json
+template.udp
+*.ovpn
+*.log
+
+__pycache__/
+*.pyc
+.venv/

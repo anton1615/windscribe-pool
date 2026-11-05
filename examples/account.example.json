@@ -1,0 +1,1 @@
+{"username": "FancyOtterRider", "password": "0x<64hex>", "ovpn_user": "<user_id>-<suffix>", "ovpn_pass": "<secret>", "traffic_max": 2147483648, "session": "optional session_auth_hash", "node": "optional pinned node hostname", "datacenter": "optional"}

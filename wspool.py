@@ -215,12 +215,19 @@ def live_slots():
 
 
 def in_use_labels():
-    """目前真的有一條活隧道在跑的帳號(死掉的隧道不算,帳號立刻可被下一個節點接手)。"""
+    """目前真的有一條活隧道在跑的帳號(死掉的隧道不算,帳號立刻可被下一個節點接手)。
+
+    draining 中(已翻 target、等排空)的舊隧道也算在內:openvpn 還掛著、
+    帳號額度還在燒,不該讓別的節點同時抓同一顆帳號。
+    """
     counts = {}
     for uid, n in NODES.items():
         tun = n.get("cur")
         if tun and tun.up:
             counts[tun.label] = counts.get(tun.label, 0) + 1
+        for old in n.get("draining", []):
+            if old.up:
+                counts[old.label] = counts.get(old.label, 0) + 1
     return counts
 
 
@@ -502,6 +509,7 @@ class Relay:
         self.port = port
         self.target = None
         self.active = 0
+        self.active_by_port = {}   # inner_port -> 這條隧道目前背著的連線數
         self.stop = threading.Event()
         self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -528,9 +536,10 @@ class Relay:
                 c.close()
                 continue
             self.active += 1
-            threading.Thread(target=self._pipe, args=(c, u), daemon=True).start()
+            self.active_by_port[target] = self.active_by_port.get(target, 0) + 1
+            threading.Thread(target=self._pipe, args=(c, u, target), daemon=True).start()
 
-    def _pipe(self, a, b):
+    def _pipe(self, a, b, target_port):
         def one(x, y):
             try:
                 while True:
@@ -555,6 +564,7 @@ class Relay:
             except Exception:
                 pass
         self.active = max(0, self.active - 1)
+        self.active_by_port[target_port] = max(0, self.active_by_port.get(target_port, 0) - 1)
 
     def close(self):
         self.stop.set()
@@ -730,6 +740,7 @@ def provision(uid, meta, node, batch, slot=None):
             meta["node"], meta["country"] = node["hostname"], node["country"]
             save_state()
             if old_slot is not None and old_slot != slot:
+                NODES[uid].setdefault("draining", []).append(old)
                 retire_tunnel(uid, old, old_slot)
             return meta, None
         err = tun.error or "tunnel failed"
@@ -746,16 +757,27 @@ def provision(uid, meta, node, batch, slot=None):
 
 
 def retire_tunnel(uid, tun, slot):
-    """舊隧道等既有連線排空後退休,並結算該 slot 的流量。"""
+    """舊隧道等「它自己背的連線」排空後退休,並結算該 slot 的流量。
+
+    呼叫時 relay.target 已翻到新隧道,所以只能看 per-tunnel 計數
+    (active_by_port),不能用 rel.target 比較。上限 300s 防 hang 死
+    的 keep-alive 連線把舊隧道永久釘住;連線歸零就當秒退休。
+    """
     def run():
         meta = node_meta(uid)
         rel = NODES.get(uid, {}).get("relay")
-        deadline = time.time() + 60
-        while rel and time.time() < deadline and rel.active > 0 and rel.target == tun.inner_port:
+        deadline = time.time() + 300
+        while rel and time.time() < deadline:
+            if rel.active_by_port.get(tun.inner_port, 0) == 0:
+                break
             time.sleep(2)
         tun.stop()
         if meta:
             settle_slot(meta, slot)
+        try:
+            NODES.get(uid, {}).get("draining", []).remove(tun)
+        except ValueError:
+            pass
         log(f"{uid}: slot{slot} retired ({tun.label})")
     threading.Thread(target=run, daemon=True).start()
 

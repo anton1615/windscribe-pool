@@ -20,8 +20,9 @@ choreography, adapted to OpenVPN tunnels on Windscribe free nodes.
 - 🚪 **A stable port per client** — public ports come from a monotonic
   counter persisted in the state file, so subscription URLs never go stale
 - 🌍 **Region switching / rotation nobody notices** — `/country` and
-  `/rotate` warm up the replacement tunnel first; existing connections keep
-  flowing while the old one drains
+  `/rotate` warm up the replacement tunnel first; streams keep flowing on
+  the old tunnel while it drains, and idle keep-alive connections are cut
+  within seconds so every *new* request rides the new exit IP
 - 🔋 **Quota self-management** — every free account has a hard 2 GiB/month
   cap; the wrapper meters bytes locally, reconciles against the API, and
   swaps a node to the next account in its batch *before* the current one

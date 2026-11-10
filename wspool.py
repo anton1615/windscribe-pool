@@ -80,6 +80,8 @@ POLL = int(os.environ.get("POLL", 120))                          # 監督/額度
 QUOTA_SOFT = float(os.environ.get("QUOTA_SOFT", 0.92))           # 本地計量到此比例就換帳號
 QUOTA_PROBE_AT = float(os.environ.get("QUOTA_PROBE_AT", 0.75))   # 超過此比例才向 API 對帳
 PROBE_GAP = int(os.environ.get("PROBE_GAP", 600))                # 同一顆帳號兩次對帳最短間隔(秒)
+KILL_RESP_GRACE = float(os.environ.get("KILL_RESP_GRACE", 3))    # rotate 後,上游已回完的閒置連線>此秒數就斬
+KILL_REQ_GRACE = float(os.environ.get("KILL_REQ_GRACE", 30))     # 請求已送、等 TTFB 的連線保留至少此秒數
 
 LOCK = threading.RLock()
 STATE = {"nodes": {}, "next_slot": 0, "accts": {}, "rotate": {}}
@@ -510,6 +512,8 @@ class Relay:
         self.target = None
         self.active = 0
         self.active_by_port = {}   # inner_port -> 這條隧道目前背著的連線數
+        self.conns = {}            # id(client_sock) -> (client_sock, upstream_sock, target_port)
+        self.lock = threading.Lock()
         self.stop = threading.Event()
         self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -537,16 +541,24 @@ class Relay:
                 continue
             self.active += 1
             self.active_by_port[target] = self.active_by_port.get(target, 0) + 1
-            threading.Thread(target=self._pipe, args=(c, u, target), daemon=True).start()
+            with self.lock:
+                self.conns[id(c)] = {"socks": (c, u), "port": target,
+                                     "last": time.time(), "from_client": True}
+            threading.Thread(target=self._pipe, args=(c, u, target, id(c)), daemon=True).start()
 
-    def _pipe(self, a, b, target_port):
-        def one(x, y):
+    def _pipe(self, a, b, target_port, conn_id):
+        def one(x, y, from_client):
             try:
                 while True:
                     d = x.recv(65536)
                     if not d:
                         break
                     y.sendall(d)
+                    with self.lock:
+                        e = self.conns.get(conn_id)
+                        if e is not None:
+                            e["last"] = time.time()
+                            e["from_client"] = from_client
             except Exception:
                 pass
             try:
@@ -554,9 +566,9 @@ class Relay:
             except Exception:
                 pass
 
-        t = threading.Thread(target=one, args=(b, a), daemon=True)
+        t = threading.Thread(target=one, args=(b, a, False), daemon=True)
         t.start()
-        one(a, b)
+        one(a, b, True)
         t.join(timeout=1)
         for s in (a, b):
             try:
@@ -565,6 +577,29 @@ class Relay:
                 pass
         self.active = max(0, self.active - 1)
         self.active_by_port[target_port] = max(0, self.active_by_port.get(target_port, 0) - 1)
+        with self.lock:
+            self.conns.pop(conn_id, None)
+
+    def kill_idle(self, target_port, grace_req, grace_resp):
+        """關掉背在 target_port 隧道上、靜默超過寬限的連線(rotate 後斬閒置 keep-alive)。
+
+        from_client=True 表示最後一次流量是客戶端→上游(請求已送出、等 TTFB),
+        用較長的 grace_req;False 表示上游剛回完(典型閒置池),用短 grace_resp。
+        無法百分之百分辨,這是 byte relay 的本質限制。
+        """
+        now = time.time()
+        with self.lock:
+            items = list(self.conns.items())
+        for conn_id, e in items:
+            if e["port"] != target_port:
+                continue
+            grace = grace_req if e["from_client"] else grace_resp
+            if now - e["last"] >= grace:
+                for s in e["socks"]:
+                    try:
+                        s.shutdown(socket.SHUT_RDWR)   # close() 叫不醒別的執行緒裡的 recv
+                    except Exception:
+                        pass
 
     def close(self):
         self.stop.set()
@@ -762,15 +797,24 @@ def retire_tunnel(uid, tun, slot):
     呼叫時 relay.target 已翻到新隧道,所以只能看 per-tunnel 計數
     (active_by_port),不能用 rel.target 比較。上限 300s 防 hang 死
     的 keep-alive 連線把舊隧道永久釘住;連線歸零就當秒退休。
+
+    drain 期間每秒叫 kill_idle:靜默超過寬限的連線直接斬,讓「下一個
+    請求必走新 IP」成立,而不是被 pooled keep-alive 釘在舊 IP 上。
+    正在跑流量的連線 last 一直刷新,不受影響。
     """
     def run():
         meta = node_meta(uid)
         rel = NODES.get(uid, {}).get("relay")
         deadline = time.time() + 300
+        last_kill = 0.0
         while rel and time.time() < deadline:
             if rel.active_by_port.get(tun.inner_port, 0) == 0:
                 break
-            time.sleep(2)
+            now = time.time()
+            if now - last_kill >= 1.0:
+                rel.kill_idle(tun.inner_port, KILL_REQ_GRACE, KILL_RESP_GRACE)
+                last_kill = now
+            time.sleep(0.5)
         tun.stop()
         if meta:
             settle_slot(meta, slot)

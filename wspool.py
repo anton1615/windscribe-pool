@@ -543,11 +543,11 @@ class Relay:
             self.active_by_port[target] = self.active_by_port.get(target, 0) + 1
             with self.lock:
                 self.conns[id(c)] = {"socks": (c, u), "port": target,
-                                     "last": time.time(), "from_client": True}
+                                     "last_up": time.time(), "last_down": time.time()}
             threading.Thread(target=self._pipe, args=(c, u, target, id(c)), daemon=True).start()
 
     def _pipe(self, a, b, target_port, conn_id):
-        def one(x, y, from_client):
+        def one(x, y, upstream):
             try:
                 while True:
                     d = x.recv(65536)
@@ -557,8 +557,7 @@ class Relay:
                     with self.lock:
                         e = self.conns.get(conn_id)
                         if e is not None:
-                            e["last"] = time.time()
-                            e["from_client"] = from_client
+                            e["last_up" if upstream else "last_down"] = time.time()
             except Exception:
                 pass
             try:
@@ -566,9 +565,9 @@ class Relay:
             except Exception:
                 pass
 
-        t = threading.Thread(target=one, args=(b, a, False), daemon=True)
+        t = threading.Thread(target=one, args=(b, a, True), daemon=True)
         t.start()
-        one(a, b, True)
+        one(a, b, False)
         t.join(timeout=1)
         for s in (a, b):
             try:
@@ -581,11 +580,17 @@ class Relay:
             self.conns.pop(conn_id, None)
 
     def kill_idle(self, target_port, grace_req, grace_resp):
-        """關掉背在 target_port 隧道上、靜默超過寬限的連線(rotate 後斬閒置 keep-alive)。
+        """關掉背在 target_port 隧道上、閒置超過寬限的連線(rotate 後斬 keep-alive)。
 
-        from_client=True 表示最後一次流量是客戶端→上游(請求已送出、等 TTFB),
-        用較長的 grace_req;False 表示上游剛回完(典型閒置池),用短 grace_resp。
-        無法百分之百分辨,這是 byte relay 的本質限制。
+        兩個方向分別計時:
+          last_up   上游→客戶端最後一次位元組(回應/串流的 token)
+          last_down 客戶端→上游最後一次位元組(請求)
+        閒置池連線:兩個方向都靜默很久 → 用 grace_resp 快速斬,讓下一個
+        請求重新 dial 走新 IP。
+        活串流:上游每幾秒就吐 token(實測最大間隔 6s),last_up 一直刷新 →
+        永遠不會被斬。
+        慢 TTFB:請求已送但上游還沒吐第一個 byte,last_up 很舊但 last_down
+        很新 → 用 grace_req 保護。
         """
         now = time.time()
         with self.lock:
@@ -593,13 +598,17 @@ class Relay:
         for conn_id, e in items:
             if e["port"] != target_port:
                 continue
-            grace = grace_req if e["from_client"] else grace_resp
-            if now - e["last"] >= grace:
-                for s in e["socks"]:
-                    try:
-                        s.shutdown(socket.SHUT_RDWR)   # close() 叫不醒別的執行緒裡的 recv
-                    except Exception:
-                        pass
+            up_idle = now - e["last_up"]
+            down_idle = now - e["last_down"]
+            if down_idle < grace_req:
+                continue          # 客戶端剛講過話:可能正在等回應,寬限
+            if up_idle < grace_resp:
+                continue          # 上游還在吐東西:是活串流,不要斬
+            for s in e["socks"]:
+                try:
+                    s.shutdown(socket.SHUT_RDWR)   # close() 叫不醒別的執行緒裡的 recv
+                except Exception:
+                    pass
 
     def close(self):
         self.stop.set()

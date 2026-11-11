@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """windscribe-pool — 一個客戶端一個穩定 port,背後是 Windscribe 免費節點的 OpenVPN 出口。
 
-架構(仿 foxyvpn-pool / urn-pool 的 byte-relay 設計):
-    client ──socks5──> <BIND_HOST>:2300x   前層 byte relay(不解協議,只搬位元組)
+架構(仿 foxyvpn-pool / urn-pool 的 relay 設計):
+    client ──socks5 / HTTP CONNECT──> <BIND_HOST>:2300x   前層 front(終結交握,之後只搬位元組)
                           │ flip
                   <inner>:3300x     socks5 後端(SO_BINDTODEVICE → tunX)
                           │
@@ -507,7 +507,6 @@ def start_socks(port, dev, stop_flag):
 
 # ---------------- 前層 byte relay ----------------
 def _socks5_dial(u, host, port):
-    """對 inner-socks 做 SOCKS5 CONNECT。True=u 已可傳目標資料。"""
     try:
         u.settimeout(25)
         u.sendall(b"\x05\x01\x00")
@@ -530,7 +529,7 @@ class Relay:
         self.target = None
         self.active = 0
         self.active_by_port = {}   # inner_port -> 這條隧道目前背著的連線數
-        self.conns = {}            # id(client_sock) -> (client_sock, upstream_sock, target_port)
+        self.conns = {}
         self.lock = threading.Lock()
         self.stop = threading.Event()
         self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -557,27 +556,22 @@ class Relay:
             except Exception:
                 c.close()
                 continue
-            if not self._http_connect_bridge(c, u):
-                continue          # 交握失敗/協議錯誤:連線已在裡面收掉
-            self.active += 1
-            self.active_by_port[target] = self.active_by_port.get(target, 0) + 1
+            threading.Thread(target=self._serve, args=(c, u, target), daemon=True).start()
+
+    def _serve(self, c, u, target):
+        with self.lock:
+            self.conns[id(c)] = {"socks": (c, u), "port": target,
+                                 "last_up": time.time(), "last_down": time.time()}
+        if not self._http_connect_bridge(c, u):
             with self.lock:
-                self.conns[id(c)] = {"socks": (c, u), "port": target,
-                                     "last_up": time.time(), "last_down": time.time()}
-            threading.Thread(target=self._pipe, args=(c, u, target, id(c)), daemon=True).start()
+                self.conns.pop(id(c), None)
+            return
+        self.active += 1
+        self.active_by_port[target] = self.active_by_port.get(target, 0) + 1
+        self._pipe(c, u, target, id(c))
 
     @staticmethod
     def _http_connect_bridge(c, u):
-        """front 同洞支援 HTTP proxy 客戶端(client 不必自起 socks→http 轉換)。
-
-        偷看第一個 byte 再決定這條連線是誰:
-          0x05        → SOCKS5:自己完成交握(原來由 inner-socks 後端做),
-                        之後 c/u 就是純資料管道
-          "CONNECT.." → HTTP CONNECT:對 inner-socks 做交握、回 200,
-                        之後同樣是純管道
-          其他        → 405 斷線
-        回 False = 連線已在函式內收掉,caller 不要 pipe。
-        """
         def drop():
             for s in (c, u):
                 try: s.close()
@@ -587,6 +581,8 @@ class Relay:
             c.settimeout(60)
             head = c.recv(1)
         except Exception:
+            return drop()
+        if not head:
             return drop()
         if head == b"\x05":
             try:
@@ -614,6 +610,8 @@ class Relay:
             try:
                 line = head + c.recv(4096)
                 while b"\r\n\r\n" not in line:
+                    if len(line) > 32768:
+                        raise ValueError("headers too large")
                     more = c.recv(4096)
                     if not more:
                         raise ValueError("truncated")
@@ -624,11 +622,11 @@ class Relay:
                     raise ValueError("not CONNECT")
                 hp = parts[1]
                 host, _, port_s = hp.rpartition(":")
+                host = host.strip("[]")     # CONNECT [::1]:443
                 if not _socks5_dial(u, host, int(port_s)):
                     raise ValueError("inner refused")
                 c.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                idx = line.find(b"\r\n\r\n")
-                left = line[idx + 4:] if idx >= 0 else b""
+                left = line.split(b"\r\n\r\n", 1)[1]
                 if left:
                     u.sendall(left)
             except Exception:
@@ -703,12 +701,12 @@ class Relay:
         for conn_id, e in items:
             if e["port"] != target_port:
                 continue
-            up_idle = now - e["last_up"]
-            down_idle = now - e["last_down"]
-            if down_idle < grace_req:
-                continue          # 客戶端剛講過話:可能正在等回應,寬限
-            if up_idle < grace_resp:
-                continue          # 上游還在吐東西:是活串流,不要斬
+            req_idle = now - e["last_down"]
+            resp_idle = now - e["last_up"]
+            if req_idle < grace_req:
+                continue
+            if resp_idle < grace_resp:
+                continue
             for s in e["socks"]:
                 try:
                     s.shutdown(socket.SHUT_RDWR)   # close() 叫不醒別的執行緒裡的 recv
@@ -914,7 +912,7 @@ def retire_tunnel(uid, tun, slot):
 
     drain 期間每秒叫 kill_idle:靜默超過寬限的連線直接斬,讓「下一個
     請求必走新 IP」成立,而不是被 pooled keep-alive 釘在舊 IP 上。
-    正在跑流量的連線 last 一直刷新,不受影響。
+    正在跑流量的連線 last_up/last_down 一直刷新,不受影響。
     """
     def run():
         meta = node_meta(uid)

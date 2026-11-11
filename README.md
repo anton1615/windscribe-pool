@@ -34,7 +34,7 @@ choreography, adapted to OpenVPN tunnels on Windscribe free nodes.
 ## 🧠 How it works
 
 ```
-client ──socks5──> <bind-host>:2300x   🚪 front (pure byte relay, no protocol)
+client ──socks5 / HTTP CONNECT──> <bind-host>:2300x   🚪 front (terminates the handshake)
                                          │
              old tunnel keeps serving its connections ◄── 🔁 flip
                                          │              (drain, then retire)
@@ -44,15 +44,21 @@ client ──socks5──> <bind-host>:2300x   🚪 front (pure byte relay, no p
 ```
 
 Every client (a `uid` of its choosing) gets a **public port** (`23000+`,
-stable for its lifetime) served by a byte-relay, and an **OpenVPN tunnel** to
+stable for its lifetime) served by a relay, and an **OpenVPN tunnel** to
 one free Windscribe node, fronted by a loopback SOCKS5 backend bound to the
 tunnel device.
 
+The front accepts **both SOCKS5 and HTTP proxy (`CONNECT`) clients** on the
+same port, so a client that speaks HTTP proxy does not need its own
+socks5→http converter. It sniffs the first byte, terminates that handshake
+itself, and dials the inner SOCKS5 backend on the client's behalf; after the
+handshake it only moves bytes.
+
 The key trick (inherited from foxyvpn-pool): SOCKS5 carries exactly **one
-tunnel per TCP connection**, so the relay in front needs to understand no
-protocol at all — it just moves bytes. A swap warms up the new tunnel, flips
-the relay, then retires the old one once its connections have drained; the
-public port never changes.
+tunnel per TCP connection**, so each client connection is independent of
+every other one. A swap warms up the new tunnel, flips the relay, then
+retires the old one once its connections have drained; the public port never
+changes.
 
 ## 🔑 The account pool
 

@@ -506,6 +506,24 @@ def start_socks(port, dev, stop_flag):
 
 
 # ---------------- 前層 byte relay ----------------
+def _socks5_dial(u, host, port):
+    """對 inner-socks 做 SOCKS5 CONNECT。True=u 已可傳目標資料。"""
+    try:
+        u.settimeout(25)
+        u.sendall(b"\x05\x01\x00")
+        r = u.recv(2)
+        if len(r) < 2 or r[0] != 5:
+            return False
+        hb = host.encode()
+        if len(hb) > 255:
+            return False
+        u.sendall(b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb + struct.pack("!H", port))
+        r2 = u.recv(10)
+        return len(r2) >= 2 and r2[1] == 0
+    except Exception:
+        return False
+
+
 class Relay:
     def __init__(self, port):
         self.port = port
@@ -539,12 +557,99 @@ class Relay:
             except Exception:
                 c.close()
                 continue
+            if not self._http_connect_bridge(c, u):
+                continue          # 交握失敗/協議錯誤:連線已在裡面收掉
             self.active += 1
             self.active_by_port[target] = self.active_by_port.get(target, 0) + 1
             with self.lock:
                 self.conns[id(c)] = {"socks": (c, u), "port": target,
                                      "last_up": time.time(), "last_down": time.time()}
             threading.Thread(target=self._pipe, args=(c, u, target, id(c)), daemon=True).start()
+
+    @staticmethod
+    def _http_connect_bridge(c, u):
+        """front 同洞支援 HTTP proxy 客戶端(client 不必自起 socks→http 轉換)。
+
+        偷看第一個 byte 再決定這條連線是誰:
+          0x05        → SOCKS5:自己完成交握(原來由 inner-socks 後端做),
+                        之後 c/u 就是純資料管道
+          "CONNECT.." → HTTP CONNECT:對 inner-socks 做交握、回 200,
+                        之後同樣是純管道
+          其他        → 405 斷線
+        回 False = 連線已在函式內收掉,caller 不要 pipe。
+        """
+        def drop():
+            for s in (c, u):
+                try: s.close()
+                except Exception: pass
+            return False
+        try:
+            c.settimeout(60)
+            head = c.recv(1)
+        except Exception:
+            return drop()
+        if head == b"\x05":
+            try:
+                nm = ord(c.recv(1))
+                c.recv(nm)
+                c.sendall(b"\x05\x00")
+                req = c.recv(4)
+                if len(req) < 4 or req[1] != 1:
+                    raise ValueError("connect only")
+                atyp = req[3]
+                if atyp == 1:
+                    host = socket.inet_ntoa(c.recv(4))
+                elif atyp == 3:
+                    host = c.recv(c.recv(1)[0]).decode("utf-8", "replace")
+                else:
+                    host = socket.inet_ntop(socket.AF_INET6, c.recv(16))
+                port = struct.unpack("!H", c.recv(2))[0]
+                if not _socks5_dial(u, host, port):
+                    c.sendall(b"\x05\x05\x00\x01" + b"\x00" * 6)   # REP=0x05 connection refused
+                    raise ValueError("inner refused")
+                c.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + struct.pack("!H", 0))
+            except Exception:
+                return drop()
+        elif head in (b"C", b"c"):
+            try:
+                line = head + c.recv(4096)
+                while b"\r\n\r\n" not in line:
+                    more = c.recv(4096)
+                    if not more:
+                        raise ValueError("truncated")
+                    line += more
+                req_line = line.split(b"\r\n", 1)[0].decode("latin1")
+                parts = req_line.split()
+                if len(parts) < 2 or parts[0].upper() != "CONNECT":
+                    raise ValueError("not CONNECT")
+                hp = parts[1]
+                host, _, port_s = hp.rpartition(":")
+                if not _socks5_dial(u, host, int(port_s)):
+                    raise ValueError("inner refused")
+                c.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                idx = line.find(b"\r\n\r\n")
+                left = line[idx + 4:] if idx >= 0 else b""
+                if left:
+                    u.sendall(left)
+            except Exception:
+                try:
+                    c.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                except Exception:
+                    pass
+                return drop()
+        else:
+            try:
+                c.sendall(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            except Exception:
+                pass
+            return drop()
+        try:
+            c.settimeout(None)
+            u.settimeout(None)
+        except Exception:
+            pass
+        return True
+
 
     def _pipe(self, a, b, target_port, conn_id):
         def one(x, y, upstream):

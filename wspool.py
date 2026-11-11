@@ -80,7 +80,7 @@ POLL = int(os.environ.get("POLL", 120))                          # 監督/額度
 QUOTA_SOFT = float(os.environ.get("QUOTA_SOFT", 0.92))           # 本地計量到此比例就換帳號
 QUOTA_PROBE_AT = float(os.environ.get("QUOTA_PROBE_AT", 0.75))   # 超過此比例才向 API 對帳
 PROBE_GAP = int(os.environ.get("PROBE_GAP", 600))                # 同一顆帳號兩次對帳最短間隔(秒)
-KILL_RESP_GRACE = float(os.environ.get("KILL_RESP_GRACE", 3))    # rotate 後,上游已回完的閒置連線>此秒數就斬
+KILL_RESP_GRACE = float(os.environ.get("KILL_RESP_GRACE", 15))   # rotate 後,上游已回完的閒置連線>此秒數就斬
 KILL_REQ_GRACE = float(os.environ.get("KILL_REQ_GRACE", 30))     # 請求已送、等 TTFB 的連線保留至少此秒數
 
 LOCK = threading.RLock()
@@ -559,16 +559,23 @@ class Relay:
             threading.Thread(target=self._serve, args=(c, u, target), daemon=True).start()
 
     def _serve(self, c, u, target):
+        # 計數與登記都在交握之前:交握中的連線也必須被 drain 看見,
+        # 否則 rotate 會在它還沒交握完時就停掉隧道。
         with self.lock:
             self.conns[id(c)] = {"socks": (c, u), "port": target,
                                  "last_up": time.time(), "last_down": time.time()}
+            self.active += 1
+            self.active_by_port[target] = self.active_by_port.get(target, 0) + 1
         if not self._http_connect_bridge(c, u):
-            with self.lock:
-                self.conns.pop(id(c), None)
+            self._drop_conn(c, target, id(c))
             return
-        self.active += 1
-        self.active_by_port[target] = self.active_by_port.get(target, 0) + 1
         self._pipe(c, u, target, id(c))
+
+    def _drop_conn(self, c, target_port, conn_id):
+        with self.lock:
+            self.conns.pop(conn_id, None)
+            self.active = max(0, self.active - 1)
+            self.active_by_port[target_port] = max(0, self.active_by_port.get(target_port, 0) - 1)
 
     @staticmethod
     def _http_connect_bridge(c, u):
@@ -577,6 +584,7 @@ class Relay:
                 try: s.close()
                 except Exception: pass
             return False
+        deadline = time.time() + 60      # 交握的總期限,不只 per-recv
         try:
             c.settimeout(60)
             head = c.recv(1)
@@ -612,6 +620,8 @@ class Relay:
                 while b"\r\n\r\n" not in line:
                     if len(line) > 32768:
                         raise ValueError("headers too large")
+                    if time.time() > deadline:
+                        raise ValueError("handshake timeout")
                     more = c.recv(4096)
                     if not more:
                         raise ValueError("truncated")
@@ -656,11 +666,13 @@ class Relay:
                     d = x.recv(65536)
                     if not d:
                         break
-                    y.sendall(d)
+                    # 在 sendall 之前打戳:對方讀得慢時 sendall 會阻塞,
+                    # 那時連線是活的不該被當成閒置。
                     with self.lock:
                         e = self.conns.get(conn_id)
                         if e is not None:
                             e["last_up" if upstream else "last_down"] = time.time()
+                    y.sendall(d)
             except Exception:
                 pass
             try:
@@ -677,10 +689,7 @@ class Relay:
                 s.close()
             except Exception:
                 pass
-        self.active = max(0, self.active - 1)
-        self.active_by_port[target_port] = max(0, self.active_by_port.get(target_port, 0) - 1)
-        with self.lock:
-            self.conns.pop(conn_id, None)
+        self._drop_conn(a, target_port, conn_id)
 
     def kill_idle(self, target_port, grace_req, grace_resp):
         """關掉背在 target_port 隧道上、閒置超過寬限的連線(rotate 後斬 keep-alive)。
@@ -918,14 +927,21 @@ def retire_tunnel(uid, tun, slot):
         meta = node_meta(uid)
         rel = NODES.get(uid, {}).get("relay")
         deadline = time.time() + 300
+        hard_deadline = deadline + 300   # 最多再多給 300s 給還在動的串流
         last_kill = 0.0
-        while rel and time.time() < deadline:
+        while rel:
             if rel.active_by_port.get(tun.inner_port, 0) == 0:
                 break
             now = time.time()
             if now - last_kill >= 1.0:
                 rel.kill_idle(tun.inner_port, KILL_REQ_GRACE, KILL_RESP_GRACE)
                 last_kill = now
+            if now >= hard_deadline:
+                break
+            if now >= deadline:
+                # 還有連線在動就延長一輪,而不是硬殺:活串流被斬掉等於回到
+                # 「rotate 會中斷回覆」的老問題。
+                deadline = now + 300
             time.sleep(0.5)
         tun.stop()
         if meta:

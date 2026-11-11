@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """windscribe-pool — 一個客戶端一個穩定 port,背後是 Windscribe 免費節點的 OpenVPN 出口。
 
-架構(仿 foxyvpn-pool / urn-pool 的 byte-relay 設計):
-    client ──socks5──> <BIND_HOST>:2300x   前層 byte relay(不解協議,只搬位元組)
+架構(仿 foxyvpn-pool / urn-pool 的 relay 設計):
+    client ──socks5 / HTTP CONNECT──> <BIND_HOST>:2300x   前層 front(終結交握,之後只搬位元組)
                           │ flip
                   <inner>:3300x     socks5 後端(SO_BINDTODEVICE → tunX)
                           │
@@ -80,7 +80,7 @@ POLL = int(os.environ.get("POLL", 120))                          # 監督/額度
 QUOTA_SOFT = float(os.environ.get("QUOTA_SOFT", 0.92))           # 本地計量到此比例就換帳號
 QUOTA_PROBE_AT = float(os.environ.get("QUOTA_PROBE_AT", 0.75))   # 超過此比例才向 API 對帳
 PROBE_GAP = int(os.environ.get("PROBE_GAP", 600))                # 同一顆帳號兩次對帳最短間隔(秒)
-KILL_RESP_GRACE = float(os.environ.get("KILL_RESP_GRACE", 3))    # rotate 後,上游已回完的閒置連線>此秒數就斬
+KILL_RESP_GRACE = float(os.environ.get("KILL_RESP_GRACE", 15))   # rotate 後,上游已回完的閒置連線>此秒數就斬
 KILL_REQ_GRACE = float(os.environ.get("KILL_REQ_GRACE", 30))     # 請求已送、等 TTFB 的連線保留至少此秒數
 
 LOCK = threading.RLock()
@@ -506,13 +506,30 @@ def start_socks(port, dev, stop_flag):
 
 
 # ---------------- 前層 byte relay ----------------
+def _socks5_dial(u, host, port):
+    try:
+        u.settimeout(25)
+        u.sendall(b"\x05\x01\x00")
+        r = u.recv(2)
+        if len(r) < 2 or r[0] != 5:
+            return False
+        hb = host.encode()
+        if len(hb) > 255:
+            return False
+        u.sendall(b"\x05\x01\x00\x03" + bytes([len(hb)]) + hb + struct.pack("!H", port))
+        r2 = u.recv(10)
+        return len(r2) >= 2 and r2[1] == 0
+    except Exception:
+        return False
+
+
 class Relay:
     def __init__(self, port):
         self.port = port
         self.target = None
         self.active = 0
         self.active_by_port = {}   # inner_port -> 這條隧道目前背著的連線數
-        self.conns = {}            # id(client_sock) -> (client_sock, upstream_sock, target_port)
+        self.conns = {}
         self.lock = threading.Lock()
         self.stop = threading.Event()
         self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -539,26 +556,123 @@ class Relay:
             except Exception:
                 c.close()
                 continue
+            threading.Thread(target=self._serve, args=(c, u, target), daemon=True).start()
+
+    def _serve(self, c, u, target):
+        # 計數與登記都在交握之前:交握中的連線也必須被 drain 看見,
+        # 否則 rotate 會在它還沒交握完時就停掉隧道。
+        with self.lock:
+            self.conns[id(c)] = {"socks": (c, u), "port": target,
+                                 "last_up": time.time(), "last_down": time.time()}
             self.active += 1
             self.active_by_port[target] = self.active_by_port.get(target, 0) + 1
-            with self.lock:
-                self.conns[id(c)] = {"socks": (c, u), "port": target,
-                                     "last": time.time(), "from_client": True}
-            threading.Thread(target=self._pipe, args=(c, u, target, id(c)), daemon=True).start()
+        if not self._http_connect_bridge(c, u):
+            self._drop_conn(c, target, id(c))
+            return
+        self._pipe(c, u, target, id(c))
+
+    def _drop_conn(self, c, target_port, conn_id):
+        with self.lock:
+            self.conns.pop(conn_id, None)
+            self.active = max(0, self.active - 1)
+            self.active_by_port[target_port] = max(0, self.active_by_port.get(target_port, 0) - 1)
+
+    @staticmethod
+    def _http_connect_bridge(c, u):
+        def drop():
+            for s in (c, u):
+                try: s.close()
+                except Exception: pass
+            return False
+        deadline = time.time() + 60      # 交握的總期限,不只 per-recv
+        try:
+            c.settimeout(60)
+            head = c.recv(1)
+        except Exception:
+            return drop()
+        if not head:
+            return drop()
+        if head == b"\x05":
+            try:
+                nm = ord(c.recv(1))
+                c.recv(nm)
+                c.sendall(b"\x05\x00")
+                req = c.recv(4)
+                if len(req) < 4 or req[1] != 1:
+                    raise ValueError("connect only")
+                atyp = req[3]
+                if atyp == 1:
+                    host = socket.inet_ntoa(c.recv(4))
+                elif atyp == 3:
+                    host = c.recv(c.recv(1)[0]).decode("utf-8", "replace")
+                else:
+                    host = socket.inet_ntop(socket.AF_INET6, c.recv(16))
+                port = struct.unpack("!H", c.recv(2))[0]
+                if not _socks5_dial(u, host, port):
+                    c.sendall(b"\x05\x05\x00\x01" + b"\x00" * 6)   # REP=0x05 connection refused
+                    raise ValueError("inner refused")
+                c.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0") + struct.pack("!H", 0))
+            except Exception:
+                return drop()
+        elif head in (b"C", b"c"):
+            try:
+                line = head + c.recv(4096)
+                while b"\r\n\r\n" not in line:
+                    if len(line) > 32768:
+                        raise ValueError("headers too large")
+                    if time.time() > deadline:
+                        raise ValueError("handshake timeout")
+                    more = c.recv(4096)
+                    if not more:
+                        raise ValueError("truncated")
+                    line += more
+                req_line = line.split(b"\r\n", 1)[0].decode("latin1")
+                parts = req_line.split()
+                if len(parts) < 2 or parts[0].upper() != "CONNECT":
+                    raise ValueError("not CONNECT")
+                hp = parts[1]
+                host, _, port_s = hp.rpartition(":")
+                host = host.strip("[]")     # CONNECT [::1]:443
+                if not _socks5_dial(u, host, int(port_s)):
+                    raise ValueError("inner refused")
+                c.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                left = line.split(b"\r\n\r\n", 1)[1]
+                if left:
+                    u.sendall(left)
+            except Exception:
+                try:
+                    c.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                except Exception:
+                    pass
+                return drop()
+        else:
+            try:
+                c.sendall(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            except Exception:
+                pass
+            return drop()
+        try:
+            c.settimeout(None)
+            u.settimeout(None)
+        except Exception:
+            pass
+        return True
+
 
     def _pipe(self, a, b, target_port, conn_id):
-        def one(x, y, from_client):
+        def one(x, y, upstream):
             try:
                 while True:
                     d = x.recv(65536)
                     if not d:
                         break
-                    y.sendall(d)
+                    # 在 sendall 之前打戳:對方讀得慢時 sendall 會阻塞,
+                    # 那時連線是活的不該被當成閒置。
                     with self.lock:
                         e = self.conns.get(conn_id)
                         if e is not None:
-                            e["last"] = time.time()
-                            e["from_client"] = from_client
+                            e["last_up" if upstream else "last_down"] = time.time()
+                    y.sendall(d)
             except Exception:
                 pass
             try:
@@ -566,26 +680,29 @@ class Relay:
             except Exception:
                 pass
 
-        t = threading.Thread(target=one, args=(b, a, False), daemon=True)
+        t = threading.Thread(target=one, args=(b, a, True), daemon=True)
         t.start()
-        one(a, b, True)
+        one(a, b, False)
         t.join(timeout=1)
         for s in (a, b):
             try:
                 s.close()
             except Exception:
                 pass
-        self.active = max(0, self.active - 1)
-        self.active_by_port[target_port] = max(0, self.active_by_port.get(target_port, 0) - 1)
-        with self.lock:
-            self.conns.pop(conn_id, None)
+        self._drop_conn(a, target_port, conn_id)
 
     def kill_idle(self, target_port, grace_req, grace_resp):
-        """關掉背在 target_port 隧道上、靜默超過寬限的連線(rotate 後斬閒置 keep-alive)。
+        """關掉背在 target_port 隧道上、閒置超過寬限的連線(rotate 後斬 keep-alive)。
 
-        from_client=True 表示最後一次流量是客戶端→上游(請求已送出、等 TTFB),
-        用較長的 grace_req;False 表示上游剛回完(典型閒置池),用短 grace_resp。
-        無法百分之百分辨,這是 byte relay 的本質限制。
+        兩個方向分別計時:
+          last_up   上游→客戶端最後一次位元組(回應/串流的 token)
+          last_down 客戶端→上游最後一次位元組(請求)
+        閒置池連線:兩個方向都靜默很久 → 用 grace_resp 快速斬,讓下一個
+        請求重新 dial 走新 IP。
+        活串流:上游每幾秒就吐 token(實測最大間隔 6s),last_up 一直刷新 →
+        永遠不會被斬。
+        慢 TTFB:請求已送但上游還沒吐第一個 byte,last_up 很舊但 last_down
+        很新 → 用 grace_req 保護。
         """
         now = time.time()
         with self.lock:
@@ -593,13 +710,17 @@ class Relay:
         for conn_id, e in items:
             if e["port"] != target_port:
                 continue
-            grace = grace_req if e["from_client"] else grace_resp
-            if now - e["last"] >= grace:
-                for s in e["socks"]:
-                    try:
-                        s.shutdown(socket.SHUT_RDWR)   # close() 叫不醒別的執行緒裡的 recv
-                    except Exception:
-                        pass
+            req_idle = now - e["last_down"]
+            resp_idle = now - e["last_up"]
+            if req_idle < grace_req:
+                continue
+            if resp_idle < grace_resp:
+                continue
+            for s in e["socks"]:
+                try:
+                    s.shutdown(socket.SHUT_RDWR)   # close() 叫不醒別的執行緒裡的 recv
+                except Exception:
+                    pass
 
     def close(self):
         self.stop.set()
@@ -800,20 +921,27 @@ def retire_tunnel(uid, tun, slot):
 
     drain 期間每秒叫 kill_idle:靜默超過寬限的連線直接斬,讓「下一個
     請求必走新 IP」成立,而不是被 pooled keep-alive 釘在舊 IP 上。
-    正在跑流量的連線 last 一直刷新,不受影響。
+    正在跑流量的連線 last_up/last_down 一直刷新,不受影響。
     """
     def run():
         meta = node_meta(uid)
         rel = NODES.get(uid, {}).get("relay")
         deadline = time.time() + 300
+        hard_deadline = deadline + 300   # 最多再多給 300s 給還在動的串流
         last_kill = 0.0
-        while rel and time.time() < deadline:
+        while rel:
             if rel.active_by_port.get(tun.inner_port, 0) == 0:
                 break
             now = time.time()
             if now - last_kill >= 1.0:
                 rel.kill_idle(tun.inner_port, KILL_REQ_GRACE, KILL_RESP_GRACE)
                 last_kill = now
+            if now >= hard_deadline:
+                break
+            if now >= deadline:
+                # 還有連線在動就延長一輪,而不是硬殺:活串流被斬掉等於回到
+                # 「rotate 會中斷回覆」的老問題。
+                deadline = now + 300
             time.sleep(0.5)
         tun.stop()
         if meta:

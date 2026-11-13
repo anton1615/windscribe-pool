@@ -1,5 +1,10 @@
 # windscribe-pool
 
+> ⚠️ **Deprecated** — this standalone repo is now part of
+> [anton1615/proxy-pool-collection](https://github.com/anton1615/proxy-pool-collection).
+> New work targets the collection repository; this one is kept for historical
+> reference and will not receive further updates.
+
 **One shared Windscribe free-account pool, many clients.** `windscribe-pool`
 turns Windscribe's free OpenVPN nodes into a small **multi-client service for
 your trusted network**: every client gets its own exit behind a stable port,
